@@ -26,7 +26,12 @@ module HairTrigger
           return [] unless sexps # no `up` method... unsupported `change` perhaps?
           sexps.each do |sexp|
             next unless (method = extract_method_call(sexp)) && [:create_trigger, :drop_trigger].include?(method)
-            trigger = instance_eval("generate_" + generator.process(sexp))
+            code = generator.process(sexp)
+            if code =~ /with_proper_connection/
+              code.gsub!(/with_proper_connection\(\w+\)\s+do\W\s+/, '')
+              code = code.reverse.sub(/dne/, '').reverse
+            end
+            trigger = instance_eval("generate_" + code)
             triggers << trigger if options[:include_manual_triggers] || trigger.options[:generated]
           end
         end
@@ -40,7 +45,16 @@ module HairTrigger
       def extract_method_call(exp)
         return nil unless exp.is_a?(Array)
         if exp[0] == :iter
-          exp = exp[1] while exp[1].is_a?(Array) && exp[1][0] == :call
+          _exp = exp.clone
+          _exp = _exp[1] while _exp[1].is_a?(Array) && _exp[1][0] == :call
+          if _exp[2] == :with_proper_connection
+            _exp = exp.clone
+            _exp = _exp[3]
+            if _exp[0] == :iter
+              _exp = _exp[1] while _exp[1].is_a?(Array) && _exp[1][0] == :call
+            end
+          end
+          exp = _exp
         end
         if exp[0] == :call
           exp[2]

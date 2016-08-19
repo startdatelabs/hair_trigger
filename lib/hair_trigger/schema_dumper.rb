@@ -13,29 +13,65 @@ module HairTrigger
     def triggers(stream)
       @adapter_name = @connection.adapter_name.downcase.to_sym
 
-      all_triggers = @connection.triggers
       db_trigger_warnings = {}
       migration_trigger_builders = []
 
-      db_triggers = whitelist_triggers(all_triggers)
+      all_triggers = nil
 
-      migration_triggers = HairTrigger.current_migrations(:in_rake_task => true, :previous_schema => self.class.previous_schema).map do |(_, builder)|
-        definitions = []
-        builder.generate.each do |statement|
-          if statement =~ /\ACREATE(.*TRIGGER| FUNCTION) ([^ \n]+)/
-            # poor man's unquote
-            type = ($1 == ' FUNCTION' ? :function : :trigger)
-            name = $2.gsub('"', '')
-
-            definitions << [name, statement, type]
-          end
+      if self.class.shard
+        self.class.with_proper_connection do
+          @connection = ActiveRecord::Base.connection
+          all_triggers = @connection.triggers
         end
-        {:builder => builder, :definitions => definitions}
+        @connection = ActiveRecord::Base.connection
+
+        migration_triggers = HairTrigger.current_shard_migrations(:in_rake_task => true, :previous_schema => self.class.previous_schema).map do |(_, builder)|
+          definitions = []
+          builder.generate.each do |statement|
+            if statement =~ /\ACREATE(.*TRIGGER| FUNCTION) ([^ \n]+)/
+              # poor man's unquote
+              type = ($1 == ' FUNCTION' ? :function : :trigger)
+              name = $2.gsub('"', '')
+
+              definitions << [name, statement, type]
+            end
+          end
+          {:builder => builder, :definitions => definitions}
+        end
+      else
+        all_triggers = @connection.triggers
+
+        migration_triggers = HairTrigger.current_migrations(:in_rake_task => true, :previous_schema => self.class.previous_schema).map do |(_, builder)|
+          definitions = []
+          builder.generate.each do |statement|
+            if statement =~ /\ACREATE(.*TRIGGER| FUNCTION) ([^ \n]+)/
+              # poor man's unquote
+              type = ($1 == ' FUNCTION' ? :function : :trigger)
+              name = $2.gsub('"', '')
+
+              definitions << [name, statement, type]
+            end
+          end
+          {:builder => builder, :definitions => definitions}
+        end
       end
+
+      db_triggers = whitelist_triggers(all_triggers)
 
       migration_triggers.each do |migration|
         next unless migration[:definitions].all? do |(name, definition, type)|
-          db_triggers[name] && (db_trigger_warnings[name] = true) && db_triggers[name] == normalize_trigger(name, definition, type)
+          db_triggers[name] && (db_trigger_warnings[name] = true) &&
+          (
+            if self.class.shard
+              self.class.with_proper_connection do
+                @connection = ActiveRecord::Base.connection
+                db_triggers[name] == normalize_trigger(name, definition, type)
+              end
+              @connection = ActiveRecord::Base.connection
+            else
+              db_triggers[name] == normalize_trigger(name, definition, type)
+            end
+          )
         end
 
         migration[:definitions].each do |(name, _, _)|
@@ -99,9 +135,23 @@ module HairTrigger
       base.class_eval do
         alias_method_chain :trailer, :triggers
         class << self
-          attr_accessor :previous_schema
+          attr_accessor :previous_schema, :shard
+
+          def dump(connection=ActiveRecord::Base.connection, stream=STDOUT, config = ActiveRecord::Base)
+            if self.shard
+              with_proper_connection do
+                new(ActiveRecord::Base.connection, generate_options(config)).dump(stream)
+                stream
+              end
+            else
+              new(connection, generate_options(config)).dump(stream)
+              stream
+            end
+          end
         end
       end
+
+      base.send :include, ::HairTrigger::ProperConnection
     end
   end
 end

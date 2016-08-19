@@ -3,6 +3,7 @@ require 'active_record'
 require 'hair_trigger/base'
 require 'hair_trigger/migrator'
 require 'hair_trigger/adapter'
+require 'hair_trigger/proper_connection'
 require 'hair_trigger/schema_dumper'
 require 'hair_trigger/railtie' if defined?(Rails::Railtie)
 
@@ -12,7 +13,7 @@ module HairTrigger
   autoload :MigrationReader, 'hair_trigger/migration_reader'
 
   class << self
-    attr_writer :model_path, :schema_rb_path, :migration_path
+    attr_writer :model_path, :schema_rb_path, :schema_shard_rb_path, :migration_path
 
     def current_triggers
       # see what the models say there should be
@@ -52,7 +53,7 @@ module HairTrigger
         options[:schema_rb_first] = true
         options[:skip_pending_migrations] = true
       end
-  
+
       # if we're in a db:schema:dump task (explict or kicked off by db:migrate),
       # we evaluate the previous schema.rb (if it exists), and then all applied
       # migrations in order (even ones older than schema.rb). this ensures we
@@ -69,7 +70,7 @@ module HairTrigger
         triggers = MigrationReader.get_triggers(migration, options)
         migrations << [migration, triggers] unless triggers.empty?
       end
-  
+
       if previous_schema = (options.has_key?(:previous_schema) ? options[:previous_schema] : File.exist?(schema_rb_path) && File.read(schema_rb_path))
         base_triggers = MigrationReader.get_triggers(previous_schema, options)
         unless base_triggers.empty?
@@ -77,9 +78,9 @@ module HairTrigger
           migrations.unshift [OpenStruct.new({:version => version}), base_triggers]
         end
       end
-      
+
       migrations = migrations.sort_by{|(migration, triggers)| migration.version} unless options[:schema_rb_first]
-  
+
       all_builders = []
       migrations.each do |(migration, triggers)|
         triggers.each do |new_trigger|
@@ -90,7 +91,59 @@ module HairTrigger
           all_builders << [migration.name, new_trigger] unless new_trigger.options[:drop]
         end
       end
-  
+
+      all_builders
+    end
+
+
+    def current_shard_migrations(options = {})
+      if options[:in_rake_task]
+        options[:include_manual_triggers] = true
+        options[:schema_rb_first] = true
+        options[:skip_pending_migrations] = true
+      end
+
+      options[:shard] = true
+
+      # if we're in a db:schema:dump task (explict or kicked off by db:migrate),
+      # we evaluate the previous schema.rb (if it exists), and then all applied
+      # migrations in order (even ones older than schema.rb). this ensures we
+      # handle db:migrate:down scenarios correctly
+      #
+      # if we're not in such a rake task (i.e. we just want to know what
+      # triggers are defined, whether or not they are applied in the db), we
+      # evaluate all migrations along with schema.rb, ordered by version
+      migrator = self.migrator
+      migrated = migrator.migrated rescue []
+      migrations = []
+      _migrations = migrator.migrations.select { |m| File.foreach(m.filename).grep(/ProperConnection/).any? }
+      _migrations.each do |migration|
+        next if options[:skip_pending_migrations] && !migrated.include?(migration.version)
+        triggers = MigrationReader.get_triggers(migration, options)
+        migrations << [migration, triggers] unless triggers.empty?
+      end
+
+      if previous_schema = (options.has_key?(:previous_schema) ? options[:previous_schema] : File.exist?(schema_shard_rb_path) && File.read(schema_shard_rb_path))
+        base_triggers = MigrationReader.get_triggers(previous_schema, options)
+        unless base_triggers.empty?
+          version = (previous_schema =~ /ActiveRecord::Schema\.define\(.*?(\d+)\)/) && $1.to_i
+          migrations.unshift [OpenStruct.new({:version => version}), base_triggers]
+        end
+      end
+
+      migrations = migrations.sort_by{|(migration, triggers)| migration.version} unless options[:schema_rb_first]
+
+      all_builders = []
+      migrations.each do |(migration, triggers)|
+        triggers.each do |new_trigger|
+          # if there is already a trigger with this name, delete it since we are
+          # either dropping it or replacing it
+          new_trigger.prepare!
+          all_builders.delete_if{ |(n, t)| t.prepared_name == new_trigger.prepared_name }
+          all_builders << [migration.name, new_trigger] unless new_trigger.options[:drop]
+        end
+      end
+
       all_builders
     end
 
@@ -101,27 +154,28 @@ module HairTrigger
     def generate_migration(silent = false)
       begin
         canonical_triggers = current_triggers
-      rescue 
+      rescue
         $stderr.puts $!
         exit 1
       end
-  
+
       migrations = current_migrations
+      migrations += current_shard_migrations
       migration_names = migrations.map(&:first)
       existing_triggers = migrations.map(&:last)
-  
+
       up_drop_triggers = []
       up_create_triggers = []
       down_drop_triggers = []
       down_create_triggers = []
-  
+
       # see which triggers need to be dropped
       existing_triggers.each do |existing|
         next if canonical_triggers.any?{ |t| t.prepared_name == existing.prepared_name }
         up_drop_triggers.concat existing.drop_triggers
         down_create_triggers << existing
       end
-  
+
       # see which triggers need to be added/replaced
       (canonical_triggers - existing_triggers).each do |new_trigger|
         up_create_triggers << new_trigger
@@ -134,7 +188,7 @@ module HairTrigger
           down_create_triggers << existing
         end
       end
-  
+
       return if up_drop_triggers.empty? && up_create_triggers.empty?
 
       migration_name = infer_migration_name(migration_names, up_create_triggers, up_drop_triggers)
@@ -205,6 +259,10 @@ end
 
     def schema_rb_path
       @schema_rb_path ||= 'db/schema.rb'
+    end
+
+    def schema_shard_rb_path
+      @schema_shard_rb_path ||= 'db/shard_schema.rb'
     end
 
     def migration_path
